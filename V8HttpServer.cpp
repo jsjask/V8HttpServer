@@ -165,28 +165,28 @@ Local<Object> WrapRequest(HttpRequest* request) {
     // outer handle scope.
     return handle_scope.Escape(result);
 }
-#define JS_METHOD(name) v8::Handle<v8::Value> name(const v8::internal::Arguments& args)
-Handle<Value> _handleRequestFunction;
+
+Handle<Function> _handleRequestFunction;
+
 static void addEventListener(const v8::FunctionCallbackInfo<v8::Value>& args) {
     if (args.Length() < 1) return;
     Isolate* isolate = args.GetIsolate();
     HandleScope scope(isolate);
     printf("addEventListener\n");
-    HttpRequest request;
-    Local<Value> v1 = Int32::New(isolate, 123);
-    // Wrap the C++ request object in a JavaScript wrapper
-    Local<Object> request_obj = WrapRequest(&request);
-    Handle<Function> func = Handle<Function>::Cast(_handleRequestFunction);
-    Handle<Value> funArgs[1] = { request_obj };
-    Handle<Object> globalObj = context->Global();
-    func->Call(context, globalObj, 1, funArgs);
 }
 
 static void Response(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    if (args.Length() < 1) return;
     Isolate* isolate = args.GetIsolate();
+    Handle<Object> _obj = Object::New(isolate);
     HandleScope scope(isolate);
     printf("Response\n");
+    if (args.Length() >= 1)
+    {
+        Local<Value> arg = args[0];
+        _obj->Set(context, 0, arg);
+    }
+    args.GetReturnValue().Set(_obj);
+
     //Local<Value> arg = args[0];
     //String::Utf8Value value(isolate, arg);
     //HttpRequestProcessor::Log(*value);
@@ -225,18 +225,26 @@ string ProcessRequest(HttpRequest* request)
             // Compile the source code.
             v8::Local<v8::Script> script =
                 v8::Script::Compile(context, source).ToLocalChecked();
-
+            script->Run(context);
             // Run the script to get the result.
             Local<Value> process_val;
             globalObj->Get(context, String::NewFromUtf8Literal(isolate, "handleRequest")).ToLocal(&process_val);
             _handleRequestFunction = process_val.As<Function>();
             if (_handleRequestFunction.IsEmpty() || !_handleRequestFunction->IsFunction())
-                printf("脚本中无handleRequest函数!\n");
-            script->Run(context);
-            // Convert the result to an UTF8 string and print it.
-            //v8::String::Utf8Value utf8(isolate, result);
-            //printf("%s\n", *utf8);
-            //resultStr = *utf8;
+                return "handleRequest not found!\n";
+            HttpRequest request;
+            // Wrap the C++ request object in a JavaScript wrapper
+            Local<Object> request_obj = WrapRequest(&request);
+            Handle<Function> func = Handle<Function>::Cast(_handleRequestFunction);
+            Handle<Value> funArgs[1] = { request_obj };
+            Handle<Object> globalObj = context->Global();
+            Local<Value> result;
+            func->Call(context, globalObj, 1, funArgs).ToLocal(&result);
+            Handle<Object> resultObj = result.As<Object>();
+            Handle<Value> arg = resultObj->Get(context, 0).ToLocalChecked();
+            v8::String::Utf8Value utf8(isolate, arg);
+            printf("%s\n", *utf8);
+            resultStr = *utf8;
         }
     }
     return resultStr;

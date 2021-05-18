@@ -8,11 +8,12 @@
 #include "include/libplatform/libplatform.h"
 #include "include/v8.h"
 using std::string;
+using namespace v8;
 static const char* s_http_port = "80";
 static struct mg_serve_http_opts s_http_server_opts;
 static v8::Isolate* isolate;
 static v8::Isolate::CreateParams create_params;
-#if 1
+#if 0
 // Reads a file into a v8 string.
 v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name) {
     FILE* file = fopen(name.c_str(), "rb");
@@ -36,10 +37,162 @@ v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name) {
         isolate, chars.get(), v8::NewStringType::kNormal, static_cast<int>(size));
     return result;
 }
+#else
+v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name);
 #endif
 
-v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name);
-string parseJs()
+class HttpRequest {
+public:
+    ~HttpRequest() { }
+    const string& Path() { return ""; };
+    const string& Referrer() { return ""; };
+    const string& Host() { return ""; };
+    const string& UserAgent() { return ""; };
+};
+v8::Local<v8::Context> context;
+static Global<ObjectTemplate> request_template_;
+/**
+ * Utility function that extracts the C++ http request object from a
+ * wrapper object.
+ */
+HttpRequest* UnwrapRequest(Local<Object> obj) {
+    Local<External> field = Local<External>::Cast(obj->GetInternalField(0));
+    void* ptr = field->Value();
+    return static_cast<HttpRequest*>(ptr);
+}
+
+
+void GetPath(Local<String> name,
+    const PropertyCallbackInfo<Value>& info) {
+    // Extract the C++ request object from the JavaScript wrapper.
+    HttpRequest* request = UnwrapRequest(info.Holder());
+
+    // Fetch the path.
+    const string& path = request->Path();
+
+    // Wrap the result in a JavaScript string and return it.
+    info.GetReturnValue().Set(
+        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
+            NewStringType::kNormal,
+            static_cast<int>(path.length())).ToLocalChecked());
+}
+
+
+void GetReferrer(
+    Local<String> name,
+    const PropertyCallbackInfo<Value>& info) {
+    HttpRequest* request = UnwrapRequest(info.Holder());
+    const string& path = request->Referrer();
+    info.GetReturnValue().Set(
+        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
+            NewStringType::kNormal,
+            static_cast<int>(path.length())).ToLocalChecked());
+}
+
+
+void GetHost(Local<String> name,
+    const PropertyCallbackInfo<Value>& info) {
+    HttpRequest* request = UnwrapRequest(info.Holder());
+    const string& path = request->Host();
+    info.GetReturnValue().Set(
+        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
+            NewStringType::kNormal,
+            static_cast<int>(path.length())).ToLocalChecked());
+}
+
+
+void GetUserAgent(
+    Local<String> name,
+    const PropertyCallbackInfo<Value>& info) {
+    HttpRequest* request = UnwrapRequest(info.Holder());
+    const string& path = request->UserAgent();
+    info.GetReturnValue().Set(
+        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
+            NewStringType::kNormal,
+            static_cast<int>(path.length())).ToLocalChecked());
+}
+Local<ObjectTemplate> MakeRequestTemplate(
+    Isolate* isolate) {
+    EscapableHandleScope handle_scope(isolate);
+
+    Local<ObjectTemplate> result = ObjectTemplate::New(isolate);
+    result->SetInternalFieldCount(1);
+
+    // Add accessors for each of the fields of the request.
+    result->SetAccessor(
+        String::NewFromUtf8Literal(isolate, "path", NewStringType::kInternalized),
+        GetPath);
+    result->SetAccessor(String::NewFromUtf8Literal(isolate, "referrer",
+        NewStringType::kInternalized),
+        GetReferrer);
+    result->SetAccessor(
+        String::NewFromUtf8Literal(isolate, "host", NewStringType::kInternalized),
+        GetHost);
+    result->SetAccessor(String::NewFromUtf8Literal(isolate, "userAgent",
+        NewStringType::kInternalized),
+        GetUserAgent);
+
+    // Again, return the result through the current handle scope.
+    return handle_scope.Escape(result);
+}
+
+Local<Object> WrapRequest(HttpRequest* request) {
+    // Local scope for temporary handles.
+    EscapableHandleScope handle_scope(isolate);
+
+    // Fetch the template for creating JavaScript http request wrappers.
+    // It only has to be created once, which we do on demand.
+    if (request_template_.IsEmpty()) {
+        Local<ObjectTemplate> raw_template = MakeRequestTemplate(isolate);
+        request_template_.Reset(isolate, raw_template);
+    }
+    Local<ObjectTemplate> templ =
+        Local<ObjectTemplate>::New(isolate, request_template_);
+
+    // Create an empty http request wrapper.
+    Local<Object> result = templ->NewInstance(isolate->GetCurrentContext()).ToLocalChecked();
+
+    // Wrap the raw C++ pointer in an External so it can be referenced
+    // from within JavaScript.
+    Local<External> request_ptr = External::New(isolate, request);
+
+    // Store the request pointer in the JavaScript wrapper.
+    result->SetInternalField(0, request_ptr);
+
+    // Return the result through the current handle scope.  Since each
+    // of these handles will go away when the handle scope is deleted
+    // we need to call Close to let one, the result, escape into the
+    // outer handle scope.
+    return handle_scope.Escape(result);
+}
+#define JS_METHOD(name) v8::Handle<v8::Value> name(const v8::internal::Arguments& args)
+Handle<Value> _handleRequestFunction;
+static void addEventListener(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    if (args.Length() < 1) return;
+    Isolate* isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+    printf("addEventListener\n");
+    HttpRequest request;
+    Local<Value> v1 = Int32::New(isolate, 123);
+    // Wrap the C++ request object in a JavaScript wrapper
+    Local<Object> request_obj = WrapRequest(&request);
+    Handle<Function> func = Handle<Function>::Cast(_handleRequestFunction);
+    Handle<Value> funArgs[1] = { request_obj };
+    Handle<Object> globalObj = context->Global();
+    func->Call(context, globalObj, 1, funArgs);
+}
+
+static void Response(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    if (args.Length() < 1) return;
+    Isolate* isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+    printf("Response\n");
+    //Local<Value> arg = args[0];
+    //String::Utf8Value value(isolate, arg);
+    //HttpRequestProcessor::Log(*value);
+}
+
+string ProcessRequest(HttpRequest* request)
 {
     string resultStr;
     {
@@ -47,16 +200,18 @@ string parseJs()
 
         // Create a stack-allocated handle scope.
         v8::HandleScope handle_scope(isolate);
+        Local<ObjectTemplate> global = ObjectTemplate::New(isolate);
+        global->Set(isolate, "addEventListener", FunctionTemplate::New(isolate, addEventListener));
+        global->Set(isolate, "Response", FunctionTemplate::New(isolate, Response));
 
-        // Create a new context.
-        v8::Local<v8::Context> context = v8::Context::New(isolate);
+        context = Context::New(isolate, NULL, global);
 
         // Enter the context for compiling and running the hello world script.
         v8::Context::Scope context_scope(context);
-
+        Handle<Object> globalObj = context->Global();
         {
             // Create a string containing the JavaScript source code.
-            string file = "hello_world.js";
+            string file = "handle_Request.js";
             if (file.empty()) {
                 fprintf(stderr, "No script was specified.\n");
                 return "No script was specified.";
@@ -72,11 +227,16 @@ string parseJs()
                 v8::Script::Compile(context, source).ToLocalChecked();
 
             // Run the script to get the result.
-            v8::Local<v8::Value> result = script->Run(context).ToLocalChecked();
+            Local<Value> process_val;
+            globalObj->Get(context, String::NewFromUtf8Literal(isolate, "handleRequest")).ToLocal(&process_val);
+            _handleRequestFunction = process_val.As<Function>();
+            if (_handleRequestFunction.IsEmpty() || !_handleRequestFunction->IsFunction())
+                printf("脚本中无handleRequest函数!\n");
+            script->Run(context);
             // Convert the result to an UTF8 string and print it.
-            v8::String::Utf8Value utf8(isolate, result);
-            printf("%s\n", *utf8);
-            resultStr = *utf8;
+            //v8::String::Utf8Value utf8(isolate, result);
+            //printf("%s\n", *utf8);
+            //resultStr = *utf8;
         }
     }
     return resultStr;
@@ -86,7 +246,7 @@ void ev_handler(struct mg_connection* nc, int ev, void* p)
 {
     if (ev == MG_EV_HTTP_REQUEST) 
     {
-        string result = parseJs();
+        string result = ProcessRequest(NULL);
         mg_send_head(nc, 200, result.size(),
             "Content-Type: text/plain\r\nConnection: close");
         mg_send(nc, result.c_str(), (int)(result.size()));

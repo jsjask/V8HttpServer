@@ -13,7 +13,7 @@ static const char* s_http_port = "80";
 static struct mg_serve_http_opts s_http_server_opts;
 static v8::Isolate* isolate;
 static v8::Isolate::CreateParams create_params;
-#if 0
+
 // Reads a file into a v8 string.
 v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name) {
     FILE* file = fopen(name.c_str(), "rb");
@@ -37,17 +37,17 @@ v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name) {
         isolate, chars.get(), v8::NewStringType::kNormal, static_cast<int>(size));
     return result;
 }
-#else
-v8::MaybeLocal<v8::String> ReadFile(v8::Isolate* isolate, const string& name);
-#endif
 
 class HttpRequest {
+private:
+    string header;
+    string body;
 public:
     ~HttpRequest() { }
-    const string& Path() { return ""; };
-    const string& Referrer() { return ""; };
-    const string& Host() { return ""; };
-    const string& UserAgent() { return ""; };
+    const string& GetHeader() { return header; };
+    void SetHeader(string s) { header = s; };
+    const string& GetBody() { return body; };
+    void SetBody(string s) { body = s; };
 };
 v8::Local<v8::Context> context;
 static Global<ObjectTemplate> request_template_;
@@ -62,13 +62,13 @@ HttpRequest* UnwrapRequest(Local<Object> obj) {
 }
 
 
-void GetPath(Local<String> name,
+void GetHeader(Local<String> name,
     const PropertyCallbackInfo<Value>& info) {
     // Extract the C++ request object from the JavaScript wrapper.
     HttpRequest* request = UnwrapRequest(info.Holder());
 
     // Fetch the path.
-    const string& path = request->Path();
+    const string& path = request->GetHeader();
 
     // Wrap the result in a JavaScript string and return it.
     info.GetReturnValue().Set(
@@ -78,39 +78,17 @@ void GetPath(Local<String> name,
 }
 
 
-void GetReferrer(
+void GetBody(
     Local<String> name,
     const PropertyCallbackInfo<Value>& info) {
     HttpRequest* request = UnwrapRequest(info.Holder());
-    const string& path = request->Referrer();
+    const string& path = request->GetBody();
     info.GetReturnValue().Set(
         String::NewFromUtf8(info.GetIsolate(), path.c_str(),
             NewStringType::kNormal,
             static_cast<int>(path.length())).ToLocalChecked());
 }
 
-
-void GetHost(Local<String> name,
-    const PropertyCallbackInfo<Value>& info) {
-    HttpRequest* request = UnwrapRequest(info.Holder());
-    const string& path = request->Host();
-    info.GetReturnValue().Set(
-        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
-            NewStringType::kNormal,
-            static_cast<int>(path.length())).ToLocalChecked());
-}
-
-
-void GetUserAgent(
-    Local<String> name,
-    const PropertyCallbackInfo<Value>& info) {
-    HttpRequest* request = UnwrapRequest(info.Holder());
-    const string& path = request->UserAgent();
-    info.GetReturnValue().Set(
-        String::NewFromUtf8(info.GetIsolate(), path.c_str(),
-            NewStringType::kNormal,
-            static_cast<int>(path.length())).ToLocalChecked());
-}
 Local<ObjectTemplate> MakeRequestTemplate(
     Isolate* isolate) {
     EscapableHandleScope handle_scope(isolate);
@@ -119,19 +97,12 @@ Local<ObjectTemplate> MakeRequestTemplate(
     result->SetInternalFieldCount(1);
 
     // Add accessors for each of the fields of the request.
-    result->SetAccessor(
-        String::NewFromUtf8Literal(isolate, "path", NewStringType::kInternalized),
-        GetPath);
-    result->SetAccessor(String::NewFromUtf8Literal(isolate, "referrer",
+    result->SetAccessor(String::NewFromUtf8Literal(isolate, "header", 
         NewStringType::kInternalized),
-        GetReferrer);
-    result->SetAccessor(
-        String::NewFromUtf8Literal(isolate, "host", NewStringType::kInternalized),
-        GetHost);
-    result->SetAccessor(String::NewFromUtf8Literal(isolate, "userAgent",
+        GetHeader);
+    result->SetAccessor(String::NewFromUtf8Literal(isolate, "body",
         NewStringType::kInternalized),
-        GetUserAgent);
-
+        GetBody);
     // Again, return the result through the current handle scope.
     return handle_scope.Escape(result);
 }
@@ -177,93 +148,95 @@ static void addEventListener(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 static void Response(const v8::FunctionCallbackInfo<v8::Value>& args) {
     Isolate* isolate = args.GetIsolate();
-    Handle<Object> _obj = Object::New(isolate);
     HandleScope scope(isolate);
     printf("Response\n");
-    if (args.Length() >= 1)
+    static HttpRequest request;
+    Local<Object> request_obj = WrapRequest(&request);
+    if (args.Length() >= 2)
     {
         Local<Value> arg = args[0];
-        _obj->Set(context, 0, arg);
+        request_obj->Set(context, 0, arg);
     }
-    args.GetReturnValue().Set(_obj);
-
-    //Local<Value> arg = args[0];
-    //String::Utf8Value value(isolate, arg);
-    //HttpRequestProcessor::Log(*value);
+    args.GetReturnValue().Set(request_obj);
 }
 
-string ProcessRequest(HttpRequest* request)
+static void mg_response(struct mg_connection* nc, string body)
 {
-    string resultStr;
+    mg_send_head(nc, 200, body.size(),
+        "Content-Type: text/plain\r\nConnection: close");
+    mg_send(nc, body.c_str(), (int)(body.size()));
+    nc->flags |= MG_F_SEND_AND_CLOSE;
+}
+
+void ProcessRequest(struct mg_connection* nc, HttpRequest* request)
+{
+
+    v8::Isolate::Scope isolate_scope(isolate);
+
+    // Create a stack-allocated handle scope.
+    v8::HandleScope handle_scope(isolate);
+    Local<ObjectTemplate> global = ObjectTemplate::New(isolate);
+    global->Set(isolate, "addEventListener", FunctionTemplate::New(isolate, addEventListener));
+    global->Set(isolate, "Response", FunctionTemplate::New(isolate, Response));
+
+    context = Context::New(isolate, NULL, global);
+
+    // Enter the context for compiling and running the hello world script.
+    v8::Context::Scope context_scope(context);
+    Handle<Object> globalObj = context->Global();
     {
-        v8::Isolate::Scope isolate_scope(isolate);
-
-        // Create a stack-allocated handle scope.
-        v8::HandleScope handle_scope(isolate);
-        Local<ObjectTemplate> global = ObjectTemplate::New(isolate);
-        global->Set(isolate, "addEventListener", FunctionTemplate::New(isolate, addEventListener));
-        global->Set(isolate, "Response", FunctionTemplate::New(isolate, Response));
-
-        context = Context::New(isolate, NULL, global);
-
-        // Enter the context for compiling and running the hello world script.
-        v8::Context::Scope context_scope(context);
-        Handle<Object> globalObj = context->Global();
-        {
-            // Create a string containing the JavaScript source code.
-            string file = "handle_Request.js";
-            if (file.empty()) {
-                fprintf(stderr, "No script was specified.\n");
-                return "No script was specified.";
-            }
-
-            v8::Local<v8::String> source;
-            if (!ReadFile(isolate, file).ToLocal(&source)) {
-                fprintf(stderr, "Error reading '%s'.\n", file.c_str());
-                return "Error reading";
-            }
-            // Compile the source code.
-            v8::Local<v8::Script> script =
-                v8::Script::Compile(context, source).ToLocalChecked();
-            script->Run(context);
-            // Run the script to get the result.
-            Local<Value> process_val;
-            globalObj->Get(context, String::NewFromUtf8Literal(isolate, "handleRequest")).ToLocal(&process_val);
-            _handleRequestFunction = process_val.As<Function>();
-            if (_handleRequestFunction.IsEmpty() || !_handleRequestFunction->IsFunction())
-                return "handleRequest not found!\n";
-            HttpRequest request;
-            // Wrap the C++ request object in a JavaScript wrapper
-            Local<Object> request_obj = WrapRequest(&request);
-            Handle<Function> func = Handle<Function>::Cast(_handleRequestFunction);
-            Handle<Value> funArgs[1] = { request_obj };
-            Handle<Object> globalObj = context->Global();
-            Local<Value> result;
-            func->Call(context, globalObj, 1, funArgs).ToLocal(&result);
-            Handle<Object> resultObj = result.As<Object>();
-            Handle<Value> arg = resultObj->Get(context, 0).ToLocalChecked();
-            v8::String::Utf8Value utf8(isolate, arg);
-            printf("%s\n", *utf8);
-            resultStr = *utf8;
+        // Create a string containing the JavaScript source code.
+        string file = "handle_Request.js";
+        if (file.empty()) {
+            mg_http_send_error(nc, 400, "No script was specified.");
+            return;
         }
+
+        v8::Local<v8::String> source;
+        if (!ReadFile(isolate, file).ToLocal(&source)) {
+            string resultStr = "Error reading";
+            resultStr.append(file.c_str());
+            mg_http_send_error(nc, 400, resultStr.c_str());
+            return;
+        }
+        // Compile the source code.
+        v8::Local<v8::Script> script =
+            v8::Script::Compile(context, source).ToLocalChecked();
+        script->Run(context);
+        // Run the script to get the result.
+        Local<Value> process_val;
+        globalObj->Get(context, String::NewFromUtf8Literal(isolate, "handleRequest")).ToLocal(&process_val);
+        _handleRequestFunction = process_val.As<Function>();
+        if (_handleRequestFunction.IsEmpty() || !_handleRequestFunction->IsFunction())
+        {
+            mg_http_send_error(nc, 400, "handleRequest not found!");
+            return;
+        }
+        // Wrap the C++ request object in a JavaScript wrapper
+        Local<Object> request_obj = WrapRequest(request);
+        Handle<Function> func = Handle<Function>::Cast(_handleRequestFunction);
+        Handle<Value> funArgs[1] = { request_obj };
+        Handle<Object> globalObj = context->Global();
+        Local<Value> result;
+        func->Call(context, globalObj, 1, funArgs).ToLocal(&result);
+        Handle<Object> resultObj = result.As<Object>();
+        Handle<Value> arg = resultObj->Get(context, 0).ToLocalChecked();
+        v8::String::Utf8Value utf8(isolate, arg);
+        printf("%s\n", *utf8);
+        mg_response(nc, *utf8);
     }
-    return resultStr;
+
 }
 
 void ev_handler(struct mg_connection* nc, int ev, void* p) 
 {
     if (ev == MG_EV_HTTP_REQUEST) 
     {
-        string result = ProcessRequest(NULL);
-        mg_send_head(nc, 200, result.size(),
-            "Content-Type: text/plain\r\nConnection: close");
-        mg_send(nc, result.c_str(), (int)(result.size()));
-        nc->flags |= MG_F_SEND_AND_CLOSE;
-        //mg_serve_http(nc, (struct http_message*)p, s_http_server_opts);
+        HttpRequest request;
+        ProcessRequest(nc , &request);
     }
 }
 
-#if 1
 int main(int argc, char* argv[]) {
     struct mg_mgr mgr;
     struct mg_connection* nc;
@@ -301,4 +274,3 @@ int main(int argc, char* argv[]) {
     v8::V8::ShutdownPlatform();
     return 0;
 }
-#endif
